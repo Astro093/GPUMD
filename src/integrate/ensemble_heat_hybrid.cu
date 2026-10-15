@@ -2,15 +2,9 @@
     Copyright 2017 Zheyong Fan and GPUMD development team
     This file is part of GPUMD.
     GPUMD is free software: you can redistribute it and/or modify
-    it under the terms of the GNU Lesser General Public License as published by
+    it under the terms of the GNU General Public License as published by
     the Free Software Foundation, either version 3 of the License, or
     (at your option) any later version.
-    GPUMD is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU Lesser General Public License for more details.
-    You should have received a copy of the GNU Lesser General Public License
-    along with GPUMD.  If not, see <https://www.gnu.org/licenses/>.
 */
 
 /*---------------------------------------------------------------------------------------------------------------------------
@@ -290,6 +284,9 @@ Ensemble_Heat_Hybrid::Ensemble_Heat_Hybrid(
 void Ensemble_Heat_Hybrid::initialize_run(
   const double time_step, Atom&, Box&, const std::vector<Group>& group)
 {
+  nhc_labels.clear();
+  has_nhc = false;
+  has_lan = false;
   size.resize(num_thermostats);
   offset.resize(num_thermostats);
   for (int i = 0; i < num_thermostats; ++i) {
@@ -335,8 +332,9 @@ void Ensemble_Heat_Hybrid::initialize_run(
   }
 
   initialize_group_kinetic_energy_workspace(group[0].number);
+  initialize_group_com_velocity_workspace(group[0].number);
+  
   if (has_nhc) {
-    initialize_group_com_velocity_workspace(group[0].number);
     nhc_factors.resize(nhc_labels.size());
     gpu_nhc_labels.resize(nhc_labels.size());
     gpu_nhc_factors.resize(nhc_factors.size());
@@ -365,115 +363,105 @@ double* Ensemble_Heat_Hybrid::get_nhc_mas(int index)
 }
 
 void Ensemble_Heat_Hybrid::integrate_heat_hybrid_half(
-  const double time_step,
-  const std::vector<Group>& group,
-  const GPU_Vector<double>& mass,
-  GPU_Vector<double>& velocity_per_atom)
+    const double time_step,
+    const std::vector<Group>& group,
+    const GPU_Vector<double>& mass,
+    GPU_Vector<double>& velocity_per_atom)
 {
-  const int number_of_atoms = mass.size();
-  const int number_of_groups = group[0].number;
+    const int number_of_atoms = mass.size();
+    const int number_of_groups = group[0].number;
 
-  if (has_nhc) {
     std::vector<double>& ek2 = group_kinetic_energy_cpu_;
     GPU_Vector<double>& vcx = group_com_velocity_x_;
     GPU_Vector<double>& vcy = group_com_velocity_y_;
     GPU_Vector<double>& vcz = group_com_velocity_z_;
-    GPU_Vector<double>& ke = group_kinetic_energy_;
+    GPU_Vector<double>& ke  = group_kinetic_energy_;
 
-    find_vc_and_ke(group, mass, velocity_per_atom, vcx.data(), vcy.data(), vcz.data(), ke.data());
-    ke.copy_to_host(ek2.data());
+    // ================= NHC half-step =================
+    if (has_nhc) {
+        find_vc_and_ke(group, mass, velocity_per_atom,
+                       vcx.data(), vcy.data(), vcz.data(), ke.data());
+        ke.copy_to_host(ek2.data());
 
-    int nhc_index = 0;
-    for (int i = 0; i < num_thermostats; i++) {
-      if (thermostat_type[i] == 0) {
-        double* pos_eta = get_nhc_pos(i);
-        double* vel_eta = get_nhc_vel(i);
-        double* mas_eta = get_nhc_mas(i);
-        double kT = K_B * target_temperature(i);
-        double dN = (double)DIM * size[i];
-        double factor = nhc(
-          NOSE_HOOVER_CHAIN_LENGTH,
-          pos_eta,
-          vel_eta,
-          mas_eta,
-          ek2[label[i]],
-          kT,
-          dN,
-          time_step * 0.5);
-        energy_transferred_n[i] += ek2[label[i]] * 0.5 * (1.0 - factor * factor);
-        nhc_factors[nhc_index++] = factor;
-      }
+        int nhc_index = 0;
+        for (int i = 0; i < num_thermostats; ++i) {
+            if (thermostat_type[i] != 0) continue;
+
+            double* pos_eta = get_nhc_pos(i);
+            double* vel_eta = get_nhc_vel(i);
+            double* mas_eta = get_nhc_mas(i);
+            double kT = K_B * target_temperature(i);
+            double dN = (double)DIM * size[i];
+
+            double factor = nhc(NOSE_HOOVER_CHAIN_LENGTH,
+                                pos_eta, vel_eta, mas_eta,
+                                ek2[label[i]], kT, dN, time_step * 0.5);
+
+            energy_transferred_n[i] += ek2[label[i]] * 0.5 * (1.0 - factor * factor);
+            nhc_factors[nhc_index++] = factor;
+        }
+
+        if (nhc_index > 0) {
+            gpu_nhc_factors.copy_from_host(nhc_factors.data());
+            scale_velocity_groups(gpu_nhc_factors, gpu_nhc_labels,
+                                  vcx.data(), vcy.data(), vcz.data(), ke.data(),
+                                  group, velocity_per_atom);
+        }
     }
 
-    gpu_nhc_factors.copy_from_host(nhc_factors.data());
-    scale_velocity_groups(
-      gpu_nhc_factors,
-      gpu_nhc_labels,
-      vcx.data(),
-      vcy.data(),
-      vcz.data(),
-      ke.data(),
-      group,
-      velocity_per_atom);
-  }
-
-  if (has_lan) {
-    std::vector<double>& ek2 = group_kinetic_energy_cpu_;
-    GPU_Vector<double>& ke = group_kinetic_energy_;
-
-    find_ke<<<number_of_groups, 512>>>(
-      group[0].size.data(),
-      group[0].size_sum.data(),
-      group[0].contents.data(),
-      mass.data(),
-      velocity_per_atom.data(),
-      velocity_per_atom.data() + number_of_atoms,
-      velocity_per_atom.data() + 2 * number_of_atoms,
-      ke.data());
-    GPU_CHECK_KERNEL
-
-    ke.copy_to_host(ek2.data());
-    for (int i = 0; i < num_thermostats; i++) {
-      if (thermostat_type[i] == 1) {
-        energy_transferred_n[i] += ek2[label[i]] * 0.5;
-      }
-    }
-
-    for (int i = 0; i < num_thermostats; i++) {
-      if (thermostat_type[i] == 1) {
-        gpu_langevin<<<(size[i] - 1) / 128 + 1, 128>>>(
-          curand_states[i].data(),
-          size[i],
-          offset[i],
-          group[0].contents.data(),
-          c1[i],
-          c2[i],
-          mass.data(),
-          velocity_per_atom.data(),
-          velocity_per_atom.data() + number_of_atoms,
-          velocity_per_atom.data() + 2 * number_of_atoms);
+    // ================= LAN half-step =================
+    if (has_lan) {
+        // --- KE before the kick ---
+        find_ke<<<number_of_groups, 512>>>(
+            group[0].size.data(), group[0].size_sum.data(),
+            group[0].contents.data(), mass.data(),
+            velocity_per_atom.data(),
+            velocity_per_atom.data() + number_of_atoms,
+            velocity_per_atom.data() + 2 * number_of_atoms,
+            ke.data());
         GPU_CHECK_KERNEL
-      }
+        ke.copy_to_host(ek2.data());
+
+        for (int i = 0; i < num_thermostats; ++i) {
+            if (thermostat_type[i] != 1) continue;
+            energy_transferred_n[i] += ek2[label[i]] * 0.5;
+        }
+
+        // --- apply the kicks ---
+        for (int i = 0; i < num_thermostats; ++i) {
+            if (thermostat_type[i] != 1) continue;
+            gpu_langevin<<<(size[i] - 1) / 128 + 1, 128>>>(
+                curand_states[i].data(), size[i], offset[i],
+                group[0].contents.data(), c1[i], c2[i], mass.data(),
+                velocity_per_atom.data(),
+                velocity_per_atom.data() + number_of_atoms,
+                velocity_per_atom.data() + 2 * number_of_atoms);
+            GPU_CHECK_KERNEL
+        }
+
+        // --- KE after the kick: this is what makes the transfer signed ---
+        find_ke<<<number_of_groups, 512>>>(
+            group[0].size.data(), group[0].size_sum.data(),
+            group[0].contents.data(), mass.data(),
+            velocity_per_atom.data(),
+            velocity_per_atom.data() + number_of_atoms,
+            velocity_per_atom.data() + 2 * number_of_atoms,
+            ke.data());
+        GPU_CHECK_KERNEL
+        ke.copy_to_host(ek2.data());
+
+        for (int i = 0; i < num_thermostats; ++i) {
+            if (thermostat_type[i] != 1) continue;
+            energy_transferred_n[i] -= ek2[label[i]] * 0.5;
+        }
     }
 
-    find_ke<<<number_of_groups, 512>>>(
-      group[0].size.data(),
-      group[0].size_sum.data(),
-      group[0].contents.data(),
-      mass.data(),
-      velocity_per_atom.data(),
-      velocity_per_atom.data() + number_of_atoms,
-      velocity_per_atom.data() + 2 * number_of_atoms,
-      ke.data());
-    GPU_CHECK_KERNEL
-
-    ke.copy_to_host(ek2.data());
-    for (int i = 0; i < num_thermostats; i++) {
-      if (thermostat_type[i] == 1) {
-        energy_transferred_n[i] -= ek2[label[i]] * 0.5;
-      }
-    }
-  }
+    // ================= base-class reporter =================
+    energy_transferred[0] = energy_transferred_n[0];
+    double cold = 0.0;
+    for (int i = 1; i < num_thermostats; ++i)
+        cold += energy_transferred_n[i];
+    energy_transferred[1] = cold;
 }
 
 void Ensemble_Heat_Hybrid::compute1(
